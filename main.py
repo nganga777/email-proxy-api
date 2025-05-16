@@ -36,13 +36,6 @@ class EmailRequest(BaseModel):
 
 @app.post("/send-email")
 def send_email(req: EmailRequest, request: Request):
-    print("==== NEW REQUEST ====")
-    print(f"SMTP Host: {req.smtpConfig.host}")
-    print(f"SMTP Port: {req.smtpConfig.port}")
-    print(f"SMTP Secure: {req.smtpConfig.secure}")
-    print(f"SMTP User: {req.smtpConfig.auth.user}")
-    print(f"Proxy Config: {req.proxyConfig}")
-
     log_entry = {
         "originalIp": req.originalIp or request.client.host,
         "proxyConfig": {
@@ -57,7 +50,7 @@ def send_email(req: EmailRequest, request: Request):
         }
     }
 
-    # Set up proxy if provided
+    # Set up proxy if provided (do this FIRST, before any other socket/smtplib operation)
     if req.proxyConfig and req.proxyConfig.host:
         try:
             socks.setdefaultproxy(
