@@ -77,11 +77,16 @@ async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_host: str, proxy_po
         
         proxy_ip = s.getpeername()[0]
         s.close()
+        
+        # Reset proxy settings
+        socks.setdefaultproxy(None)
         return {
             "success": True,
             "proxyIP": proxy_ip
         }
     except Exception as e:
+        # Reset proxy settings
+        socks.setdefaultproxy(None)
         return {
             "success": False,
             "error": str(e)
@@ -101,6 +106,9 @@ def create_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[Proxy
     
     server = smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=20)
     server.set_debuglevel(1)
+    
+    # Reset proxy settings after creating the SMTP connection
+    socks.setdefaultproxy(None)
     return server
 
 @app.post("/send-email")
