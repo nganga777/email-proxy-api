@@ -110,26 +110,26 @@ async def send_email(req: EmailRequest, request: Request):
             log_entry["proxyError"] = str(e)
             log_entry["fallbackToDirect"] = True
 
-    try:
-        
+try:
     smtp = aiosmtplib.SMTP(
-    hostname=req.smtpConfig.host,
-    port=req.smtpConfig.port,
-    timeout=10
+        hostname=req.smtpConfig.host,
+        port=req.smtpConfig.port,
+        timeout=10
     )
-await smtp.connect()
+    await smtp.connect()
 
-# If secure is True, use STARTTLS (for port 587)
-if req.smtpConfig.secure:
-    await smtp.starttls()
+    # If secure is True, use STARTTLS (for port 587)
+    if req.smtpConfig.secure:
+        await smtp.starttls()
 
-await smtp.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
+    await smtp.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
 
-        log_entry["connectionVerified"] = True
-    except Exception as e:
-        log_entry["connectionVerified"] = False
-        log_entry["verifyError"] = str(e)
-        return {"success": False, "error": str(e), "logs": log_entry}
+    log_entry["connectionVerified"] = True
+except Exception as e:
+    log_entry["connectionVerified"] = False
+    log_entry["verifyError"] = str(e)
+    return {"success": False, "error": str(e), "logs": log_entry}
+
 
     try:
         from_addr = f'"{req.senderName}" <{req.senderEmail}>'
