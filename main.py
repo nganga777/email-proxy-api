@@ -60,16 +60,27 @@ class EmailRequest(BaseModel):
     code: str
     originalIp: Optional[str] = None
 
-async def get_proxy_ip(proxy_host: str, proxy_port: int) -> dict:
+async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_host: str, proxy_port: int, proxy_username: Optional[str] = None, proxy_password: Optional[str] = None) -> dict:
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(5)
-            s.connect((proxy_host, proxy_port))
-            proxy_ip = s.getpeername()[0]
-            return {
-                "success": True,
-                "proxyIP": proxy_ip
-            }
+        socks.setdefaultproxy(
+            socks.SOCKS5,
+            proxy_host,
+            proxy_port,
+            True,
+            proxy_username,
+            proxy_password
+        )
+        socks.wrapmodule(smtplib)
+        
+        server = smtplib.SMTP(smtp_host, smtp_port, timeout=20)
+        server.ehlo()
+        
+        proxy_ip = server.getpeername()[0]
+        server.quit()
+        return {
+            "success": True,
+            "proxyIP": proxy_ip
+        }
     except Exception as e:
         return {
             "success": False,
@@ -113,7 +124,7 @@ async def send_email(req: EmailRequest, request: Request):
     use_proxy = False
     if req.proxyConfig and req.proxyConfig.host:
         try:
-            proxy_ip_info = await get_proxy_ip(req.proxyConfig.host, req.proxyConfig.port)
+            proxy_ip_info = await get_proxy_ip(req.smtpConfig.host, req.smtpConfig.port, req.proxyConfig.host, req.proxyConfig.port, req.proxyConfig.username, req.proxyConfig.password)
             if proxy_ip_info["success"]:
                 log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
                 use_proxy = True
