@@ -6,35 +6,11 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
-from logging.config import dictConfig
 import socks  # PySocks library
-
-# Logging configuration (same as before)
-logging_config = {
-    "version": 1,
-    "formatters": {
-        "default": {
-            "format": "[%(asctime)s] %(levelname)s in %(module)s: %(message)s",
-        }
-    },
-    "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-            "stream": "ext://sys.stdout",
-            "formatter": "default"
-        }
-    },
-    "root": {
-        "level": "INFO",
-        "handlers": ["console"]
-    }
-}
-
-dictConfig(logging_config)
 
 app = FastAPI()
 
-# Model definitions (same as before)
+# Model definitions
 class SMTPAuth(BaseModel):
     user: str
     password: str
@@ -61,8 +37,8 @@ class EmailRequest(BaseModel):
     code: str
     originalIp: Optional[str] = None
 
-def create_proxy_socket(proxy_config: ProxyConfig, timeout=20):
-    """Create a socket that connects through the proxy"""
+def create_proxy_socket(proxy_config: ProxyConfig, smtp_host: str, smtp_port: int):
+    """Create and connect a socket through the proxy"""
     sock = socks.socksocket()
     sock.set_proxy(
         proxy_type=socks.SOCKS5,
@@ -71,27 +47,23 @@ def create_proxy_socket(proxy_config: ProxyConfig, timeout=20):
         username=proxy_config.username,
         password=proxy_config.password
     )
-    sock.settimeout(timeout)
+    sock.settimeout(20)
+    sock.connect((smtp_host, smtp_port))
     return sock
 
 def create_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[ProxyConfig] = None):
     """Create SMTP connection with optional proxy"""
     if proxy_config:
-        # Create proxy socket first
-        sock = create_proxy_socket(proxy_config)
-        sock.connect((smtp_config.host, smtp_config.port))
+        # Create and connect proxy socket
+        sock = create_proxy_socket(proxy_config, smtp_config.host, smtp_config.port)
         
         # Create SMTP connection with existing socket
-        server = smtplib.SMTP()
+        server = smtplib.SMTP(timeout=20)
         server.sock = sock
         server.connect(smtp_config.host, smtp_config.port)
     else:
         # Regular direct connection
-        server = smtplib.SMTP(
-            host=smtp_config.host,
-            port=smtp_config.port,
-            timeout=20
-        )
+        server = smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=20)
     
     server.set_debuglevel(1)
     return server
@@ -101,16 +73,10 @@ async def send_email(req: EmailRequest, request: Request):
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
         "originalIp": req.originalIp or request.client.host,
-        "beforeProxyIp": request.client.host,
         "proxyConfig": {
             "host": getattr(req.proxyConfig, "host", None),
             "port": getattr(req.proxyConfig, "port", None),
             "hasAuth": bool(getattr(req.proxyConfig, "username", None) and getattr(req.proxyConfig, "password", None))
-        },
-        "requestData": {
-            "toEmail": req.toEmail,
-            "senderEmail": req.senderEmail,
-            "subject": req.subject
         }
     }
 
@@ -122,18 +88,14 @@ async def send_email(req: EmailRequest, request: Request):
             server.starttls()
             server.ehlo()
         
-        # Verify connection
-        try:
-            server.noop()
-            log_entry["connectionVerified"] = True
-        except Exception as verify_error:
-            log_entry["connectionVerified"] = False
-            log_entry["verifyError"] = str(verify_error)
-            raise verify_error
-        
-        # Authenticate and send email
+        # Get the actual connection IP (should be proxy IP if using proxy)
+        connection_ip = server.sock.getpeername()[0]
+        log_entry["connectionIp"] = connection_ip
+
+        # Authenticate
         server.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
         
+        # Create email with headers that will show the proxy IP
         message_id = f"<{uuid.uuid4()}@{req.smtpConfig.host}>"
         from_addr = f'"{req.senderName}" <{req.senderEmail}>'
         to_addr = req.toEmail
@@ -141,10 +103,12 @@ async def send_email(req: EmailRequest, request: Request):
         code = req.code
         
         message = f"""\
+Received: from {connection_ip} (via proxy)
+Message-ID: {message_id}
 From: {from_addr}
 To: {to_addr}
 Subject: {subject}
-Message-ID: {message_id}
+Date: {datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S +0000')}
 Content-Type: text/html
 
 <p>Your verification code is: <strong>{code}</strong></p>
@@ -153,19 +117,14 @@ Content-Type: text/html
         server.sendmail(from_addr, [to_addr], message)
         server.quit()
         
-        log_entry["finalOutcome"] = "success"
-        log_entry["smtpSuccess"] = True
-        
         return {
             "success": True,
             "messageId": message_id,
+            "connectionIp": connection_ip,
             "logs": log_entry
         }
         
     except Exception as e:
-        log_entry["smtpSuccess"] = False
-        log_entry["smtpError"] = str(e)
-        log_entry["finalOutcome"] = "error"
         return {
             "success": False,
             "error": str(e),
