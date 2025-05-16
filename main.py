@@ -63,7 +63,6 @@ def get_proxy_ip(proxy_config: ProxyConfig) -> dict:
 
 @app.post("/send-email")
 def send_email(req: EmailRequest, request: Request):
-    # Build logEntry as in JS
     log_entry = {
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "originalIp": req.originalIp or request.client.host,
@@ -82,12 +81,18 @@ def send_email(req: EmailRequest, request: Request):
     smtp_logs: List[str] = []
     use_proxy = False
 
-    # Proxy test: Try connecting to the SMTP server via the proxy first
+    # Set up proxy for smtplib if provided (MUST be before any SMTP object is created)
     if req.proxyConfig and req.proxyConfig.host:
         try:
-            print("Testing proxy connection to SMTP server...")
-            test_sock = socks.socksocket()
-            test_sock.set_proxy(
+            proxy_ip_info = get_proxy_ip(req.proxyConfig)
+            if proxy_ip_info["success"]:
+                log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
+                use_proxy = True
+            else:
+                log_entry["proxyError"] = proxy_ip_info["error"]
+                log_entry["fallbackToDirect"] = True
+            # Set up the proxy globally for smtplib
+            socks.setdefaultproxy(
                 socks.SOCKS5,
                 req.proxyConfig.host,
                 req.proxyConfig.port,
@@ -95,41 +100,7 @@ def send_email(req: EmailRequest, request: Request):
                 req.proxyConfig.username,
                 req.proxyConfig.password
             )
-            test_sock.settimeout(20)
-            test_sock.connect((req.smtpConfig.host, req.smtpConfig.port))
-            print("Proxy can reach SMTP server!")
-            test_sock.close()
-        except Exception as e:
-            tb = traceback.format_exc()
-            print("Proxy cannot reach SMTP server:", repr(e))
-            print(tb)
-            log_entry["proxyError"] = str(e)
-            log_entry["proxyTraceback"] = tb
-            return {
-                "success": False,
-                "error": f"Proxy cannot reach SMTP server: {e}",
-                "logs": log_entry
-            }
-
-    # Set up proxy for smtplib if provided
-    if req.proxyConfig and req.proxyConfig.host:
-        try:
-            proxy_ip_info = get_proxy_ip(req.proxyConfig)
-            if proxy_ip_info["success"]:
-                log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
-                use_proxy = True
-                socks.setdefaultproxy(
-                    socks.SOCKS5,
-                    req.proxyConfig.host,
-                    req.proxyConfig.port,
-                    True,
-                    req.proxyConfig.username,
-                    req.proxyConfig.password
-                )
-                socks.wrapmodule(smtplib)
-            else:
-                log_entry["proxyError"] = proxy_ip_info["error"]
-                log_entry["fallbackToDirect"] = True
+            socks.wrapmodule(smtplib)
         except Exception as e:
             log_entry["proxyError"] = repr(e)
             log_entry["fallbackToDirect"] = True
@@ -154,7 +125,7 @@ Content-Type: text/html
 
     # Verify connection (simulate as best as possible)
     try:
-        server = smtplib.SMTP(req.smtpConfig.host, req.smtpConfig.port, timeout=20)
+        server = smtplib.SMTP(req.smtpConfig.host, req.smtpConfig.port, timeout=60)
         smtp_logs.append("SMTP connection established")
         server.ehlo()
         if req.smtpConfig.secure and req.smtpConfig.port == 587:
@@ -165,8 +136,10 @@ Content-Type: text/html
         smtp_logs.append("SMTP login successful")
         log_entry["connectionVerified"] = True
     except Exception as verifyError:
+        tb = traceback.format_exc()
         log_entry["connectionVerified"] = False
         log_entry["verifyError"] = str(verifyError)
+        log_entry["verifyTraceback"] = tb
         log_entry["smtpLogs"] = smtp_logs
         return {
             "success": False,
@@ -189,8 +162,10 @@ Content-Type: text/html
             "logs": log_entry
         }
     except Exception as e:
+        tb = traceback.format_exc()
         smtp_logs.append(f"Error sending email: {e}")
         log_entry["smtpLogs"] = smtp_logs
+        log_entry["sendTraceback"] = tb
         return {
             "success": False,
             "error": str(e),
