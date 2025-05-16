@@ -7,6 +7,30 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+from logging.config import dictConfig
+
+# Logging configuration
+logging_config = {
+    "version": 1,
+    "formatters": {
+        "default": {
+            "format": "[%(asctime)s] %(levelname)s in %(module)s: %(message)s",
+        }
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+            "formatter": "default"
+        }
+    },
+    "root": {
+        "level": "INFO",
+        "handlers": ["console"]
+    }
+}
+
+dictConfig(logging_config)
 
 app = FastAPI()
 
@@ -52,6 +76,22 @@ async def get_proxy_ip(proxy_host: str, proxy_port: int) -> dict:
             "error": str(e)
         }
 
+def create_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[ProxyConfig] = None):
+    if proxy_config:
+        socks.setdefaultproxy(
+            socks.SOCKS5,
+            proxy_config.host,
+            proxy_config.port,
+            True,
+            proxy_config.username,
+            proxy_config.password
+        )
+        socks.wrapmodule(smtplib)
+    
+    server = smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=20)
+    server.set_debuglevel(1)
+    return server
+
 @app.post("/send-email")
 async def send_email(req: EmailRequest, request: Request):
     log_entry = {
@@ -71,27 +111,12 @@ async def send_email(req: EmailRequest, request: Request):
     }
 
     use_proxy = False
-    proxy_agent = None
-
-    # Set up proxy if provided
     if req.proxyConfig and req.proxyConfig.host:
         try:
-            # Get proxy IP information
             proxy_ip_info = await get_proxy_ip(req.proxyConfig.host, req.proxyConfig.port)
             if proxy_ip_info["success"]:
                 log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
                 use_proxy = True
-                
-                # Configure SOCKS proxy
-                socks.setdefaultproxy(
-                    socks.SOCKS5,
-                    req.proxyConfig.host,
-                    req.proxyConfig.port,
-                    True,
-                    req.proxyConfig.username,
-                    req.proxyConfig.password
-                )
-                socks.wrapmodule(smtplib)
                 log_entry["proxyUsed"] = True
             else:
                 raise Exception('Failed to get proxy IP')
@@ -101,7 +126,6 @@ async def send_email(req: EmailRequest, request: Request):
     else:
         log_entry["noProxyConfigured"] = True
 
-    # Generate Message-ID
     message_id = f"<{uuid.uuid4()}@{req.smtpConfig.host}>"
     from_addr = f'"{req.senderName}" <{req.senderEmail}>'
     to_addr = req.toEmail
@@ -117,22 +141,13 @@ Content-Type: text/html
 <p>Your verification code is: <strong>{code}</strong></p>
 """
 
-    smtp_logs = []
     try:
-        # Create SMTP connection
-        server = smtplib.SMTP(req.smtpConfig.host, req.smtpConfig.port, timeout=20)
-        
-        # Log SMTP communication
-        server.set_debuglevel(1)
-        debug_msgs = []
-        server._debug_smtp = lambda *args: debug_msgs.append(" ".join(str(x) for x in args))
-        
+        server = create_smtp_connection(req.smtpConfig, req.proxyConfig)
         server.ehlo()
         if req.smtpConfig.secure and req.smtpConfig.port == 587:
             server.starttls()
             server.ehlo()
         
-        # Verify connection (similar to Node.js transporter.verify())
         try:
             server.noop()
             log_entry["connectionVerified"] = True
@@ -144,9 +159,6 @@ Content-Type: text/html
         server.sendmail(from_addr, [to_addr], message)
         server.quit()
         
-        # Collect SMTP logs
-        smtp_logs = debug_msgs
-        log_entry["smtpLogs"] = smtp_logs
         log_entry["connectionType"] = "proxy" if use_proxy else "direct"
         log_entry["finalOutcome"] = "success"
         log_entry["smtpSuccess"] = True
@@ -160,8 +172,6 @@ Content-Type: text/html
         log_entry["smtpSuccess"] = False
         log_entry["smtpError"] = str(e)
         log_entry["finalOutcome"] = "error"
-        if 'smtpLogs' not in log_entry:
-            log_entry["smtpLogs"] = smtp_logs
         return {
             "success": False,
             "error": str(e),
