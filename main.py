@@ -3,7 +3,7 @@ import uuid
 import smtplib
 import socks
 import socket
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
@@ -71,71 +71,51 @@ async def send_email(req: EmailRequest, request: Request):
     }
 
     use_proxy = False
-
-    # Set up proxy if provided
-    if req.proxyConfig and req.proxyConfig.host:
-        try:
-            proxy_ip_info = await get_proxy_ip(req.proxyConfig.host, req.proxyConfig.port)
-            if proxy_ip_info["success"]:
-                log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
-                use_proxy = True
-                
-                # Reset any existing proxy settings
-                socks.setdefaultproxy()
-                socks.setdefaultproxy(
-                    socks.SOCKS5,
-                    req.proxyConfig.host,
-                    req.proxyConfig.port,
-                    True,
-                    req.proxyConfig.username,
-                    req.proxyConfig.password
-                )
-                socket.socket = socks.socksocket
-        except Exception as e:
-            log_entry["proxyError"] = str(e)
-            log_entry["fallbackToDirect"] = True
-            # Reset to direct connection
-            socks.setdefaultproxy()
-            socket.socket = socket._socketobject
-    else:
-        log_entry["noProxyConfigured"] = True
-
-    # Generate Message-ID
-    message_id = f"<{uuid.uuid4()}@{req.smtpConfig.host}>"
-    from_addr = f'"{req.senderName}" <{req.senderEmail}>'
-    message = f"""\
-From: {from_addr}
-To: {req.toEmail}
-Subject: {req.subject}
-Message-ID: {message_id}
-Content-Type: text/html
-
-<p>Your verification code is: <strong>{req.code}</strong></p>
-"""
-
-    smtp_logs = []
     server = None
+    smtp_logs = []
+
     try:
-        # Create SMTP connection with longer timeout
+        # Proxy setup
+        if req.proxyConfig and req.proxyConfig.host:
+            try:
+                proxy_ip_info = await get_proxy_ip(req.proxyConfig.host, req.proxyConfig.port)
+                if proxy_ip_info["success"]:
+                    log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
+                    use_proxy = True
+                    
+                    socks.setdefaultproxy()
+                    socks.setdefaultproxy(
+                        socks.SOCKS5,
+                        req.proxyConfig.host,
+                        req.proxyConfig.port,
+                        True,
+                        req.proxyConfig.username,
+                        req.proxyConfig.password
+                    )
+                    socket.socket = socks.socksocket
+            except Exception as e:
+                log_entry["proxyError"] = str(e)
+                log_entry["fallbackToDirect"] = True
+                socks.setdefaultproxy()
+                socket.socket = socket._socketobject
+
+        # SMTP Connection
         server = smtplib.SMTP(timeout=30)
         server.connect(req.smtpConfig.host, req.smtpConfig.port)
         
-        # Log SMTP communication
-        server.set_debuglevel(1)
+        # Debug logging
         debug_msgs = []
+        server.set_debuglevel(1)
         server._debug_smtp = lambda *args: debug_msgs.append(" ".join(str(x) for x in args))
         
-        # Try EHLO first, then fallback to HELO if needed
-        try:
-            code, message = server.ehlo()
-            if code != 250:
-                server.helo()
-        except smtplib.SMTPHeloError:
-            raise Exception("Server refused HELO/EHLO command")
+        # SMTP Handshake
+        code, msg = server.ehlo()
+        if code != 250:
+            server.helo()
         
         if req.smtpConfig.secure and req.smtpConfig.port == 587:
             server.starttls()
-            server.ehlo()  # Re-EHLO after STARTTLS
+            server.ehlo()
         
         # Verify connection
         try:
@@ -145,23 +125,37 @@ Content-Type: text/html
             log_entry["connectionVerified"] = False
             log_entry["verifyError"] = str(verify_error)
         
+        # Authentication and sending
         server.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
-        server.sendmail(from_addr, [req.toEmail], message)
+        server.sendmail(
+            f'"{req.senderName}" <{req.senderEmail}>',
+            [req.toEmail],
+            f"""From: "{req.senderName}" <{req.senderEmail}>
+To: {req.toEmail}
+Subject: {req.subject}
+Message-ID: <{uuid.uuid4()}@{req.smtpConfig.host}>
+Content-Type: text/html
+
+<p>Your verification code is: <strong>{req.code}</strong></p>
+"""
+        )
         
-        # Collect SMTP logs
-        smtp_logs = debug_msgs
+        # Successful response
         log_entry.update({
-            "smtpLogs": smtp_logs,
+            "smtpLogs": debug_msgs,
             "connectionType": "proxy" if use_proxy else "direct",
             "finalOutcome": "success",
             "smtpSuccess": True
         })
         
-        return {
+        response = {
             "success": True,
-            "messageId": message_id,
+            "messageId": f"<{uuid.uuid4()}@{req.smtpConfig.host}>",
             "logs": log_entry
         }
+        
+        return response
+        
     except smtplib.SMTPException as e:
         log_entry.update({
             "smtpLogs": smtp_logs,
@@ -187,12 +181,11 @@ Content-Type: text/html
             "logs": log_entry
         }
     finally:
-        if server:
-            try:
+        try:
+            if server:
                 server.quit()
-            except:
-                pass
-        # Always reset proxy settings
+        except:
+            pass
         socks.setdefaultproxy()
         socket.socket = socket._socketobject
 
