@@ -3,7 +3,7 @@ import uuid
 import smtplib
 import socks
 import socket
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
@@ -71,18 +71,17 @@ async def send_email(req: EmailRequest, request: Request):
     }
 
     use_proxy = False
-    proxy_agent = None
 
     # Set up proxy if provided
     if req.proxyConfig and req.proxyConfig.host:
         try:
-            # Get proxy IP information
             proxy_ip_info = await get_proxy_ip(req.proxyConfig.host, req.proxyConfig.port)
             if proxy_ip_info["success"]:
                 log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
                 use_proxy = True
                 
-                # Configure SOCKS proxy
+                # Reset proxy settings in case of previous failures
+                socks.setdefaultproxy()  # Clear existing proxy
                 socks.setdefaultproxy(
                     socks.SOCKS5,
                     req.proxyConfig.host,
@@ -91,36 +90,37 @@ async def send_email(req: EmailRequest, request: Request):
                     req.proxyConfig.username,
                     req.proxyConfig.password
                 )
-                socks.wrapmodule(smtplib)
-                log_entry["proxyUsed"] = True
+                socket.socket = socks.socksocket  # Apply proxy to all sockets
             else:
                 raise Exception('Failed to get proxy IP')
         except Exception as e:
             log_entry["proxyError"] = str(e)
             log_entry["fallbackToDirect"] = True
+            # Reset to direct connection if proxy fails
+            socks.setdefaultproxy()  # Clear proxy settings
+            socket.socket = socket._socketobject  # Restore original socket
     else:
         log_entry["noProxyConfigured"] = True
 
     # Generate Message-ID
     message_id = f"<{uuid.uuid4()}@{req.smtpConfig.host}>"
     from_addr = f'"{req.senderName}" <{req.senderEmail}>'
-    to_addr = req.toEmail
-    subject = req.subject
-    code = req.code
     message = f"""\
 From: {from_addr}
-To: {to_addr}
-Subject: {subject}
+To: {req.toEmail}
+Subject: {req.subject}
 Message-ID: {message_id}
 Content-Type: text/html
 
-<p>Your verification code is: <strong>{code}</strong></p>
+<p>Your verification code is: <strong>{req.code}</strong></p>
 """
 
     smtp_logs = []
+    server = None
     try:
-        # Create SMTP connection
-        server = smtplib.SMTP(req.smtpConfig.host, req.smtpConfig.port, timeout=20)
+        # Create SMTP connection with explicit timeout
+        server = smtplib.SMTP(timeout=20)
+        server.connect(req.smtpConfig.host, req.smtpConfig.port)
         
         # Log SMTP communication
         server.set_debuglevel(1)
@@ -132,7 +132,7 @@ Content-Type: text/html
             server.starttls()
             server.ehlo()
         
-        # Verify connection (similar to Node.js transporter.verify())
+        # Verify connection
         try:
             server.noop()
             log_entry["connectionVerified"] = True
@@ -141,32 +141,61 @@ Content-Type: text/html
             log_entry["verifyError"] = str(verify_error)
         
         server.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
-        server.sendmail(from_addr, [to_addr], message)
-        server.quit()
+        server.sendmail(from_addr, [req.toEmail], message)
         
         # Collect SMTP logs
         smtp_logs = debug_msgs
-        log_entry["smtpLogs"] = smtp_logs
-        log_entry["connectionType"] = "proxy" if use_proxy else "direct"
-        log_entry["finalOutcome"] = "success"
-        log_entry["smtpSuccess"] = True
+        log_entry.update({
+            "smtpLogs": smtp_logs,
+            "connectionType": "proxy" if use_proxy else "direct",
+            "finalOutcome": "success",
+            "smtpSuccess": True
+        })
         
         return {
             "success": True,
             "messageId": message_id,
             "logs": log_entry
         }
+    except smtplib.SMTPException as e:
+        log_entry.update({
+            "smtpLogs": smtp_logs,
+            "smtpError": str(e),
+            "finalOutcome": "error",
+            "smtpSuccess": False
+        })
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error": str(e),
+                "logs": log_entry
+            }
+        )
     except Exception as e:
-        log_entry["smtpSuccess"] = False
-        log_entry["smtpError"] = str(e)
-        log_entry["finalOutcome"] = "error"
-        if 'smtpLogs' not in log_entry:
-            log_entry["smtpLogs"] = smtp_logs
-        return {
-            "success": False,
-            "error": str(e),
-            "logs": log_entry
-        }
+        log_entry.update({
+            "smtpLogs": smtp_logs,
+            "unexpectedError": str(e),
+            "finalOutcome": "error",
+            "smtpSuccess": False
+        })
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": str(e),
+                "logs": log_entry
+            }
+        )
+    finally:
+        if server:
+            try:
+                server.quit()
+            except:
+                pass
+        # Always reset proxy settings after use
+        socks.setdefaultproxy()
+        socket.socket = socket._socketobject
 
 if __name__ == "__main__":
     import uvicorn
