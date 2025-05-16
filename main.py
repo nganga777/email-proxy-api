@@ -2,7 +2,7 @@ import os
 import uuid
 import smtplib
 import socks
-import socket
+import socket as original_socket  # Keep reference to original socket
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import Optional
@@ -62,6 +62,9 @@ class EmailRequest(BaseModel):
 
 async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_host: str, proxy_port: int, proxy_username: Optional[str] = None, proxy_password: Optional[str] = None) -> dict:
     try:
+        # Reset to original socket first
+        original_socket.socket = original_socket._realsocket
+        
         socks.setdefaultproxy(
             socks.SOCKS5,
             proxy_host,
@@ -70,24 +73,32 @@ async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_host: str, proxy_po
             proxy_username,
             proxy_password
         )
-        socks.wrapmodule(socket)
+        socks.wrapmodule(original_socket)
         
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s = original_socket.socket(original_socket.AF_INET, original_socket.SOCK_STREAM)
         s.connect((smtp_host, smtp_port))
         
         proxy_ip = s.getpeername()[0]
         s.close()
+        
+        # Reset to original socket
+        original_socket.socket = original_socket._realsocket
         return {
             "success": True,
             "proxyIP": proxy_ip
         }
     except Exception as e:
+        # Reset to original socket on error
+        original_socket.socket = original_socket._realsocket
         return {
             "success": False,
             "error": str(e)
         }
 
 def create_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[ProxyConfig] = None):
+    # Reset to original socket first
+    original_socket.socket = original_socket._realsocket
+    
     if proxy_config:
         socks.setdefaultproxy(
             socks.SOCKS5,
@@ -101,12 +112,15 @@ def create_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[Proxy
     
     server = smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=20)
     server.set_debuglevel(1)
+    
+    # Reset to original socket after creating connection
+    original_socket.socket = original_socket._realsocket
     return server
 
 @app.post("/send-email")
 async def send_email(req: EmailRequest, request: Request):
-    # Reset proxy settings
-    socks.setdefaultproxy(None)
+    # Reset sockets at start of each request
+    original_socket.socket = original_socket._realsocket
     
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
