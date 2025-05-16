@@ -117,12 +117,16 @@ async def send_email(req: EmailRequest, request: Request):
     # SMTP connection and authentication
     try:
         print("Setting up SMTP connection...")
-        smtp = aiosmtplib.SMTP(
-            hostname=req.smtpConfig.host,
-            port=req.smtpConfig.port,
-            timeout=10,
-            sock=smtp_sock
-        )
+        smtp_kwargs = {
+            "hostname": req.smtpConfig.host,
+            "timeout": 10,
+        }
+        if smtp_sock is not None:
+            smtp_kwargs["sock"] = smtp_sock
+        else:
+            smtp_kwargs["port"] = req.smtpConfig.port
+
+        smtp = aiosmtplib.SMTP(**smtp_kwargs)
         await smtp.connect()
         print("Connected to SMTP server.")
 
