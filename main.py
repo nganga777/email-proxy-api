@@ -126,12 +126,14 @@ async def send_email(req: EmailRequest, request: Request):
         await smtp.connect()
         print("Connected to SMTP server.")
 
-        # Debug: Show logic for TLS/STARTTLS
-        print(f"About to check for STARTTLS: secure={req.smtpConfig.secure}, port={req.smtpConfig.port}")
-        if req.smtpConfig.secure and req.smtpConfig.port == 587:
+        # Only call STARTTLS for port 587, secure, and NOT using proxy
+        print(f"About to check for STARTTLS: secure={req.smtpConfig.secure}, port={req.smtpConfig.port}, use_proxy={use_proxy}")
+        if req.smtpConfig.secure and req.smtpConfig.port == 587 and not use_proxy:
             print("Calling STARTTLS...")
             await smtp.starttls()
             print("STARTTLS completed.")
+        else:
+            print("Skipping STARTTLS (already using TLS or proxy in use)")
 
         print("Logging in to SMTP server...")
         await smtp.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
