@@ -71,6 +71,7 @@ async def send_email(req: EmailRequest, request: Request):
     }
 
     use_proxy = False
+    proxy_agent = None
 
     # Set up proxy if provided
     if req.proxyConfig and req.proxyConfig.host:
@@ -80,7 +81,6 @@ async def send_email(req: EmailRequest, request: Request):
                 log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
                 use_proxy = True
                 
-                socks.setdefaultproxy()
                 socks.setdefaultproxy(
                     socks.SOCKS5,
                     req.proxyConfig.host,
@@ -89,76 +89,93 @@ async def send_email(req: EmailRequest, request: Request):
                     req.proxyConfig.username,
                     req.proxyConfig.password
                 )
-                socket.socket = socks.socksocket
+                socks.wrapmodule(smtplib)
                 log_entry["proxyUsed"] = True
         except Exception as e:
             log_entry["proxyError"] = str(e)
             log_entry["fallbackToDirect"] = True
-            socks.setdefaultproxy()
-            socket.socket = socket._socketobject
     else:
         log_entry["noProxyConfigured"] = True
 
     # Generate Message-ID
     message_id = f"<{uuid.uuid4()}@{req.smtpConfig.host}>"
     from_addr = f'"{req.senderName}" <{req.senderEmail}>'
+    to_addr = req.toEmail
+    subject = req.subject
+    code = req.code
     message = f"""\
 From: {from_addr}
-To: {req.toEmail}
-Subject: {req.subject}
+To: {to_addr}
+Subject: {subject}
 Message-ID: {message_id}
 Content-Type: text/html
 
-<p>Your verification code is: <strong>{req.code}</strong></p>
+<p>Your verification code is: <strong>{code}</strong></p>
 """
 
     smtp_logs = []
     server = None
     try:
-        # Create SMTP connection with enhanced logging
-        server = smtplib.SMTP(timeout=30)
-        server.connect(req.smtpConfig.host, req.smtpConfig.port)
+        # Create SMTP connection with simplified logging
+        smtp_logs.append(f"Connecting to SMTP server at {req.smtpConfig.host}:{req.smtpConfig.port}")
+        server = smtplib.SMTP(req.smtpConfig.host, req.smtpConfig.port, timeout=20)
+        smtp_logs.append("SMTP connection established")
         
-        # Enhanced debug logging
+        # Minimal debug logging for critical events only
         debug_msgs = []
-        server.set_debuglevel(1)
+        server.set_debuglevel(0)  # Disable verbose logging
         
-        # Custom debug handler that captures timestamps
-        def debug_handler(*args):
-            timestamp = datetime.utcnow().isoformat()
-            debug_msg = " ".join(str(arg) for arg in args)
-            debug_msgs.append(f"[{timestamp}] {debug_msg}")
+        def log_critical_events(*args):
+            msg = ' '.join(str(x) for x in args)
+            if "235" in msg:  # Authentication success
+                debug_msgs.append("SMTP authentication successful")
+            elif "250" in msg and "MAIL FROM" in msg:  # Sender accepted
+                debug_msgs.append("Sender address accepted")
+            elif "250" in msg and "RCPT TO" in msg:  # Recipient accepted
+                debug_msgs.append("Recipient address accepted")
+            elif "250" in msg and "Mail accepted" in msg:  # Message accepted
+                debug_msgs.append("Message content accepted")
+            elif "221" in msg:  # Connection closing
+                debug_msgs.append("SMTP connection closing normally")
         
-        server._debug_smtp = debug_handler
+        server._debug_smtp = log_critical_events
         
         # SMTP handshake
-        code, msg = server.ehlo()
-        if code != 250:
-            server.helo()
-        
+        server.ehlo()
         if req.smtpConfig.secure and req.smtpConfig.port == 587:
             server.starttls()
             server.ehlo()
-        
-        # Connection verification
+            smtp_logs.append("TLS encryption established")
+
+        # Verify connection
         try:
             server.noop()
+            smtp_logs.append("Server connection verified")
             log_entry["connectionVerified"] = True
         except Exception as verify_error:
+            smtp_logs.append(f"Connection verification failed: {str(verify_error)}")
             log_entry["connectionVerified"] = False
             log_entry["verifyError"] = str(verify_error)
         
-        # Authentication and sending
+        # Authentication
+        smtp_logs.append(f"Authenticating as {req.smtpConfig.auth.user}")
         server.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
-        server.sendmail(from_addr, [req.toEmail], message)
+        smtp_logs.append("Authentication successful")
         
-        # Store enhanced logs
-        log_entry.update({
-            "smtpLogs": debug_msgs,
-            "connectionType": "proxy" if use_proxy else "direct",
-            "finalOutcome": "success",
-            "smtpSuccess": True
-        })
+        # Send email
+        server.sendmail(from_addr, [to_addr], message)
+        smtp_logs.append("Email successfully submitted to server")
+        
+        # Close connection
+        server.quit()
+        smtp_logs.append("Connection closed normally")
+        
+        # Combine all logs
+        smtp_logs.extend(debug_msgs)
+        log_entry["smtpLogs"] = smtp_logs
+        log_entry["connectionType"] = "proxy" if use_proxy else "direct"
+        log_entry["finalOutcome"] = "success"
+        log_entry["smtpSuccess"] = True
         
         return {
             "success": True,
@@ -167,6 +184,7 @@ Content-Type: text/html
         }
         
     except smtplib.SMTPException as e:
+        smtp_logs.append(f"SMTP protocol error: {str(e)}")
         log_entry.update({
             "smtpLogs": smtp_logs,
             "smtpError": str(e),
@@ -179,6 +197,7 @@ Content-Type: text/html
             "logs": log_entry
         }
     except Exception as e:
+        smtp_logs.append(f"Unexpected error: {str(e)}")
         log_entry.update({
             "smtpLogs": smtp_logs,
             "unexpectedError": str(e),
