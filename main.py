@@ -3,7 +3,6 @@ import uuid
 import smtplib
 import socks
 import socket
-import logging
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import Optional
@@ -83,18 +82,23 @@ def proxy_context(proxy_config: Optional[ProxyConfig] = None):
         socks.setdefaultproxy(None)
         socket.socket = original_socket
 
-async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_config: ProxyConfig) -> dict:
-    """Test proxy connection and get the proxy IP"""
+async def get_proxy_ip(proxy_config: ProxyConfig) -> dict:
+    """Test proxy connection and get the proxy's outgoing IP"""
     try:
         with proxy_context(proxy_config):
+            # Connect to a reliable public service to detect our external IP
+            test_host = "8.8.8.8"  # Google DNS
+            test_port = 53  # DNS port
+            
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(10)
-            s.connect((smtp_host, smtp_port))
-            proxy_ip = s.getsockname()[0]  # Gets the proxy's outgoing IP
+            s.connect((test_host, test_port))
+            proxy_ip = s.getsockname()[0]  # This gets the proxy's outgoing IP
             s.close()
+            
             return {
                 "success": True,
-                "proxyIP": proxy_ip
+                "proxyIP": proxy_ip  # This will match what external services see
             }
     except Exception as e:
         return {
@@ -105,16 +109,9 @@ async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_config: ProxyConfig
 def create_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[ProxyConfig] = None):
     """Create SMTP connection with optional proxy"""
     with proxy_context(proxy_config):
-        try:
-            if smtp_config.port == 465:
-                server = smtplib.SMTP_SSL(smtp_config.host, smtp_config.port, timeout=20)
-            else:
-                server = smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=20)
-            server.set_debuglevel(2)  # Enable verbose logging
-            return server
-        except Exception as e:
-            logging.error(f"SMTP Connection Error: {str(e)}")
-            raise
+        server = smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=20)
+        server.set_debuglevel(1)
+        return server
 
 @app.post("/send-email")
 async def send_email(req: EmailRequest, request: Request):
@@ -138,7 +135,7 @@ async def send_email(req: EmailRequest, request: Request):
     use_proxy = False
     if req.proxyConfig and req.proxyConfig.host:
         try:
-            proxy_ip_info = await get_proxy_ip(req.smtpConfig.host, req.smtpConfig.port, req.proxyConfig)
+            proxy_ip_info = await get_proxy_ip(req.proxyConfig)
             if proxy_ip_info["success"]:
                 log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
                 use_proxy = True
@@ -175,50 +172,30 @@ Content-Type: text/html
         server = None
         try:
             server = create_smtp_connection(req.smtpConfig, req.proxyConfig if use_proxy else None)
-            
-            # Extended handshake process
             server.ehlo()
+            
             if req.smtpConfig.secure and req.smtpConfig.port == 587:
                 server.starttls()
                 server.ehlo()
             
-            # Verify connection
             try:
                 server.noop()
                 log_entry["connectionVerified"] = True
             except Exception as verify_error:
                 log_entry["connectionVerified"] = False
                 log_entry["verifyError"] = str(verify_error)
-                raise Exception(f"Connection verification failed: {verify_error}")
             
-            # Authenticate
             server.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
+            server.sendmail(from_addr, [to_addr], message)
             
-            # Send email
-            send_result = server.sendmail(from_addr, [to_addr], message)
-            if not send_result:  # Empty dict means success
-                log_entry["finalOutcome"] = "success"
-                log_entry["smtpSuccess"] = True
-                return {
-                    "success": True,
-                    "messageId": message_id,
-                    "logs": log_entry
-                }
-            else:
-                raise Exception(f"Send failed: {send_result}")
-                
-        except smtplib.SMTPAuthenticationError as e:
-            log_entry["smtpError"] = f"Authentication failed: {str(e)}"
-            raise
-        except smtplib.SMTPException as e:
-            log_entry["smtpError"] = f"SMTP protocol error: {str(e)}"
-            raise
-        except socket.timeout:
-            log_entry["smtpError"] = "Connection timed out"
-            raise
-        except Exception as e:
-            log_entry["smtpError"] = f"Unexpected error: {str(e)}"
-            raise
+            log_entry["finalOutcome"] = "success"
+            log_entry["smtpSuccess"] = True
+            
+            return {
+                "success": True,
+                "messageId": message_id,
+                "logs": log_entry
+            }
         finally:
             if server:
                 try:
@@ -226,6 +203,8 @@ Content-Type: text/html
                 except:
                     pass
     except Exception as e:
+        log_entry["smtpSuccess"] = False
+        log_entry["smtpError"] = str(e)
         log_entry["finalOutcome"] = "error"
         return {
             "success": False,
