@@ -3,6 +3,7 @@ import uuid
 import smtplib
 import socks
 import socket
+import http.client
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import Optional
@@ -82,24 +83,22 @@ def proxy_context(proxy_config: Optional[ProxyConfig] = None):
         socks.setdefaultproxy(None)
         socket.socket = original_socket
 
+def get_public_ip_via_proxy(proxy_config: ProxyConfig) -> str:
+    with proxy_context(proxy_config):
+        conn = http.client.HTTPSConnection("api.ipify.org", timeout=10)
+        conn.request("GET", "/")
+        response = conn.getresponse()
+        ip = response.read().decode()
+        conn.close()
+        return ip
+
 async def get_proxy_ip(proxy_config: ProxyConfig) -> dict:
-    """Test proxy connection and get the proxy's outgoing IP"""
     try:
-        with proxy_context(proxy_config):
-            # Connect to a reliable public service to detect our external IP
-            test_host = "8.8.8.8"  # Google DNS
-            test_port = 53  # DNS port
-            
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(10)
-            s.connect((test_host, test_port))
-            proxy_ip = s.getsockname()[0]  # This gets the proxy's outgoing IP
-            s.close()
-            
-            return {
-                "success": True,
-                "proxyIP": proxy_ip  # This will match what external services see
-            }
+        ip = get_public_ip_via_proxy(proxy_config)
+        return {
+            "success": True,
+            "proxyIP": ip
+        }
     except Exception as e:
         return {
             "success": False,
