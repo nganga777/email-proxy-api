@@ -1,12 +1,10 @@
 import os
-import socket
 import uuid
+import smtplib
+import socks
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
-import aiosmtplib
-import socks
-import asyncio
+from typing import Optional
 
 app = FastAPI()
 
@@ -36,33 +34,8 @@ class EmailRequest(BaseModel):
     code: str
     originalIp: Optional[str] = None
 
-async def get_proxy_ip(proxy_config: ProxyConfig) -> Dict[str, Any]:
-    try:
-        s = socks.socksocket()
-        s.set_proxy(
-            socks.SOCKS5,
-            proxy_config.host,
-            proxy_config.port,
-            username=proxy_config.username,
-            password=proxy_config.password
-        )
-        s.settimeout(5)
-        s.connect(("ifconfig.me", 80))
-        s.sendall(b"GET /ip HTTP/1.1\r\nHost: ifconfig.me\r\n\r\n")
-        data = b""
-        while True:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-        s.close()
-        ip = data.split(b"\r\n\r\n")[-1].decode().strip()
-        return {"success": True, "proxyIP": ip}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
 @app.post("/send-email")
-async def send_email(req: EmailRequest, request: Request):
+def send_email(req: EmailRequest, request: Request):
     print("==== NEW REQUEST ====")
     print(f"SMTP Host: {req.smtpConfig.host}")
     print(f"SMTP Port: {req.smtpConfig.port}")
@@ -71,9 +44,7 @@ async def send_email(req: EmailRequest, request: Request):
     print(f"Proxy Config: {req.proxyConfig}")
 
     log_entry = {
-        "timestamp": str(asyncio.get_event_loop().time()),
         "originalIp": req.originalIp or request.client.host,
-        "beforeProxyIp": request.client.host,
         "proxyConfig": {
             "host": getattr(req.proxyConfig, "host", None),
             "port": getattr(req.proxyConfig, "port", None),
@@ -85,83 +56,33 @@ async def send_email(req: EmailRequest, request: Request):
             "subject": req.subject
         }
     }
-    smtp_logs = []
-    use_proxy = False
-    smtp_sock = None
 
-    # Proxy setup
+    # Set up proxy if provided
     if req.proxyConfig and req.proxyConfig.host:
         try:
-            print("Trying to get proxy IP...")
-            proxy_ip_info = await get_proxy_ip(req.proxyConfig)
-            print(f"Proxy IP Info: {proxy_ip_info}")
-            if proxy_ip_info["success"]:
-                log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
-                use_proxy = True
-                smtp_sock = socks.socksocket()
-                smtp_sock.set_proxy(
-                    socks.SOCKS5,
-                    req.proxyConfig.host,
-                    req.proxyConfig.port,
-                    username=req.proxyConfig.username,
-                    password=req.proxyConfig.password
-                )
-                smtp_sock.settimeout(20)
-                smtp_sock.connect((req.smtpConfig.host, req.smtpConfig.port))
-                smtp_sock.setblocking(False)
-            else:
-                log_entry["proxyError"] = proxy_ip_info["error"]
-                log_entry["fallbackToDirect"] = True
-                print(f"Proxy error: {proxy_ip_info['error']}")
+            socks.setdefaultproxy(
+                socks.SOCKS5,
+                req.proxyConfig.host,
+                req.proxyConfig.port,
+                True,
+                req.proxyConfig.username,
+                req.proxyConfig.password
+            )
+            socks.wrapmodule(smtplib)
+            log_entry["proxyUsed"] = True
         except Exception as e:
             log_entry["proxyError"] = repr(e)
-            log_entry["fallbackToDirect"] = True
-            print(f"Proxy setup exception: {repr(e)}")
+            return {"success": False, "error": f"Proxy setup failed: {e}", "logs": log_entry}
+    else:
+        log_entry["proxyUsed"] = False
 
-    # SMTP connection and authentication
-    try:
-        print("Setting up SMTP connection...")
-        smtp_kwargs = {
-            "hostname": req.smtpConfig.host,
-            "timeout": 10,
-        }
-        if smtp_sock is not None:
-            smtp_kwargs["sock"] = smtp_sock
-        else:
-            smtp_kwargs["port"] = req.smtpConfig.port
-
-        smtp = aiosmtplib.SMTP(**smtp_kwargs)
-        await smtp.connect()
-        print("Connected to SMTP server.")
-
-        # Only call STARTTLS for port 587, secure, and NOT using proxy
-        print(f"About to check for STARTTLS: secure={req.smtpConfig.secure}, port={req.smtpConfig.port}, use_proxy={use_proxy}")
-        if req.smtpConfig.secure and req.smtpConfig.port == 587 and not use_proxy:
-            print("Calling STARTTLS...")
-            await smtp.starttls()
-            print("STARTTLS completed.")
-        else:
-            print("Skipping STARTTLS (already using TLS or proxy in use)")
-
-        print("Logging in to SMTP server...")
-        await smtp.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
-        print("SMTP login successful.")
-        log_entry["connectionVerified"] = True
-    except Exception as e:
-        print(f"SMTP connection/auth error: {e}")
-        log_entry["connectionVerified"] = False
-        log_entry["verifyError"] = str(e)
-        return {"success": False, "error": str(e), "logs": log_entry}
-
-    # Send email
-    try:
-        from_addr = f'"{req.senderName}" <{req.senderEmail}>'
-        to_addr = req.toEmail
-        subject = req.subject
-        code = req.code
-        # Generate a Message-ID
-        message_id = f"<{uuid.uuid4()}@{req.smtpConfig.host}>"
-        message = f"""\
+    # Generate Message-ID
+    message_id = f"<{uuid.uuid4()}@{req.smtpConfig.host}>"
+    from_addr = f'"{req.senderName}" <{req.senderEmail}>'
+    to_addr = req.toEmail
+    subject = req.subject
+    code = req.code
+    message = f"""\
 From: {from_addr}
 To: {to_addr}
 Subject: {subject}
@@ -170,22 +91,25 @@ Content-Type: text/html
 
 <p>Your verification code is: <strong>{code}</strong></p>
 """
-        print("Sending email...")
-        result = await smtp.sendmail(from_addr, [to_addr], message)
-        await smtp.quit()
-        print(f"Sendmail result: {result}")
-        print("Email sent and SMTP connection closed.")
-        log_entry["smtpLogs"] = smtp_logs
-        log_entry["connectionType"] = "proxy" if use_proxy else "direct"
-        log_entry["finalOutcome"] = "success"
 
+    try:
+        server = smtplib.SMTP(req.smtpConfig.host, req.smtpConfig.port, timeout=20)
+        server.ehlo()
+        if req.smtpConfig.secure and req.smtpConfig.port == 587:
+            server.starttls()
+            server.ehlo()
+        server.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
+        server.sendmail(from_addr, [to_addr], message)
+        server.quit()
+        log_entry["smtpSuccess"] = True
         return {
             "success": True,
             "messageId": message_id,
             "logs": log_entry
         }
     except Exception as e:
-        print(f"Error sending email: {e}")
+        log_entry["smtpSuccess"] = False
+        log_entry["smtpError"] = repr(e)
         return {"success": False, "error": str(e), "logs": log_entry}
 
 if __name__ == "__main__":
