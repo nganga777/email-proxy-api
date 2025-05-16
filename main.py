@@ -10,8 +10,9 @@ from typing import Optional
 from datetime import datetime
 from logging.config import dictConfig
 from contextlib import contextmanager
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-# Logging configuration
+# Logging configuration (same as your original)
 logging_config = {
     "version": 1,
     "formatters": {
@@ -31,7 +32,6 @@ logging_config = {
         "handlers": ["console"]
     }
 }
-
 dictConfig(logging_config)
 
 app = FastAPI()
@@ -64,7 +64,6 @@ class EmailRequest(BaseModel):
 
 @contextmanager
 def proxy_context(proxy_config: Optional[ProxyConfig] = None):
-    """Context manager for handling proxy configuration cleanup"""
     original_socket = socket.socket
     try:
         if proxy_config:
@@ -79,7 +78,6 @@ def proxy_context(proxy_config: Optional[ProxyConfig] = None):
             socket.socket = socks.socksocket
         yield
     finally:
-        # Always restore original socket
         socks.setdefaultproxy(None)
         socket.socket = original_socket
 
@@ -106,15 +104,23 @@ async def get_proxy_ip(proxy_config: ProxyConfig) -> dict:
         }
 
 def create_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[ProxyConfig] = None):
-    """Create SMTP connection with optional proxy"""
     with proxy_context(proxy_config):
         server = smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=20)
         server.set_debuglevel(1)
         return server
 
+# --- Jinja2 setup ---
+env = Environment(
+    loader=FileSystemLoader("templates"),
+    autoescape=select_autoescape(['html', 'xml'])
+)
+
+def render_email_template(code: str) -> str:
+    template = env.get_template("email_template.html")
+    return template.render(code=code)
+
 @app.post("/send-email")
 async def send_email(req: EmailRequest, request: Request):
-    # Initialize logging entry
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
         "originalIp": req.originalIp or request.client.host,
@@ -157,6 +163,10 @@ async def send_email(req: EmailRequest, request: Request):
     to_addr = req.toEmail
     subject = req.subject
     code = req.code
+
+    # --- Use the template ---
+    html_body = render_email_template(code)
+
     message = f"""\
 From: {from_addr}
 To: {to_addr}
@@ -164,7 +174,7 @@ Subject: {subject}
 Message-ID: {message_id}
 Content-Type: text/html
 
-<p>Your verification code is: <strong>{code}</strong></p>
+{html_body}
 """
 
     try:
@@ -172,24 +182,19 @@ Content-Type: text/html
         try:
             server = create_smtp_connection(req.smtpConfig, req.proxyConfig if use_proxy else None)
             server.ehlo()
-            
             if req.smtpConfig.secure and req.smtpConfig.port == 587:
                 server.starttls()
                 server.ehlo()
-            
             try:
                 server.noop()
                 log_entry["connectionVerified"] = True
             except Exception as verify_error:
                 log_entry["connectionVerified"] = False
                 log_entry["verifyError"] = str(verify_error)
-            
             server.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
             server.sendmail(from_addr, [to_addr], message)
-            
             log_entry["finalOutcome"] = "success"
             log_entry["smtpSuccess"] = True
-            
             return {
                 "success": True,
                 "messageId": message_id,
