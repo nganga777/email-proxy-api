@@ -1,16 +1,40 @@
 import os
 import uuid
 import smtplib
+import socks
 import socket
-import socks  # PySocks
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+from logging.config import dictConfig
+from contextlib import contextmanager
+
+# Logging configuration
+logging_config = {
+    "version": 1,
+    "formatters": {
+        "default": {
+            "format": "[%(asctime)s] %(levelname)s in %(module)s: %(message)s",
+        }
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+            "formatter": "default"
+        }
+    },
+    "root": {
+        "level": "INFO",
+        "handlers": ["console"]
+    }
+}
+
+dictConfig(logging_config)
 
 app = FastAPI()
 
-# Model definitions remain the same
 class SMTPAuth(BaseModel):
     user: str
     password: str
@@ -35,71 +59,154 @@ class EmailRequest(BaseModel):
     toEmail: str
     subject: str
     code: str
+    originalIp: Optional[str] = None
 
-def get_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[ProxyConfig] = None):
+@contextmanager
+def proxy_context(proxy_config: Optional[ProxyConfig] = None):
+    """Context manager for handling proxy configuration cleanup"""
+    original_socket = socket.socket
+    try:
+        if proxy_config:
+            socks.setdefaultproxy(
+                socks.SOCKS5,
+                proxy_config.host,
+                proxy_config.port,
+                True,
+                proxy_config.username,
+                proxy_config.password
+            )
+            socket.socket = socks.socksocket
+        yield
+    finally:
+        # Always restore original socket
+        socks.setdefaultproxy(None)
+        socket.socket = original_socket
+
+async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_config: ProxyConfig) -> dict:
+    """Test proxy connection and get the proxy IP"""
+    try:
+        with proxy_context(proxy_config):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            s.connect((smtp_host, smtp_port))
+            proxy_ip = s.getpeername()[0]
+            s.close()
+            return {
+                "success": True,
+                "proxyIP": proxy_ip
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def create_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[ProxyConfig] = None):
     """Create SMTP connection with optional proxy"""
-    if proxy_config:
-        # Create a new socket that will use the proxy
-        sock = socks.socksocket()
-        sock.set_proxy(
-            proxy_type=socks.SOCKS5,
-            addr=proxy_config.host,
-            port=proxy_config.port,
-            username=proxy_config.username,
-            password=proxy_config.password
-        )
-        
-        # Connect through proxy
-        sock.connect((smtp_config.host, smtp_config.port))
-        
-        # Create SMTP connection with existing socket
-        smtp = smtplib.SMTP()
-        smtp.sock = sock
-        smtp.connect(smtp_config.host, smtp_config.port)
-    else:
-        # Regular direct connection
-        smtp = smtplib.SMTP(smtp_config.host, smtp_config.port)
-    
-    return smtp
+    with proxy_context(proxy_config):
+        server = smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=20)
+        server.set_debuglevel(1)
+        return server
 
 @app.post("/send-email")
 async def send_email(req: EmailRequest, request: Request):
-    try:
-        # Create the connection
-        server = get_smtp_connection(req.smtpConfig, req.proxyConfig)
-        
-        # Verify proxy is being used by checking the peer address
-        if req.proxyConfig:
-            peer_addr = server.sock.getpeername()[0]
-            print(f"Connected via proxy. Peer address: {peer_addr}")
-        
-        # Standard SMTP flow
-        server.ehlo()
-        if req.smtpConfig.secure and req.smtpConfig.port == 587:
-            server.starttls()
-            server.ehlo()
-        
-        server.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
-        
-        # Create standard email without header modifications
-        message_id = f"<{uuid.uuid4()}@{req.smtpConfig.host}>"
-        message = f"""\
-From: "{req.senderName}" <{req.senderEmail}>
-To: {req.toEmail}
-Subject: {req.subject}
+    # Initialize logging entry
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "originalIp": req.originalIp or request.client.host,
+        "beforeProxyIp": request.client.host,
+        "proxyConfig": {
+            "host": getattr(req.proxyConfig, "host", None),
+            "port": getattr(req.proxyConfig, "port", None),
+            "hasAuth": bool(getattr(req.proxyConfig, "username", None) and getattr(req.proxyConfig, "password", None))
+        },
+        "requestData": {
+            "toEmail": req.toEmail,
+            "senderEmail": req.senderEmail,
+            "subject": req.subject
+        }
+    }
+
+    use_proxy = False
+    if req.proxyConfig and req.proxyConfig.host:
+        try:
+            proxy_ip_info = await get_proxy_ip(req.smtpConfig.host, req.smtpConfig.port, req.proxyConfig)
+            if proxy_ip_info["success"]:
+                log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
+                use_proxy = True
+                log_entry["proxyUsed"] = True
+                log_entry["connectionType"] = "proxy"
+            else:
+                log_entry["proxyError"] = proxy_ip_info["error"]
+                log_entry["fallbackToDirect"] = True
+                log_entry["connectionType"] = "direct"
+        except Exception as e:
+            log_entry["proxyError"] = str(e)
+            log_entry["fallbackToDirect"] = True
+            log_entry["connectionType"] = "direct"
+    else:
+        log_entry["noProxyConfigured"] = True
+        log_entry["connectionType"] = "direct"
+
+    message_id = f"<{uuid.uuid4()}@{req.smtpConfig.host}>"
+    from_addr = f'"{req.senderName}" <{req.senderEmail}>'
+    to_addr = req.toEmail
+    subject = req.subject
+    code = req.code
+    message = f"""\
+From: {from_addr}
+To: {to_addr}
+Subject: {subject}
 Message-ID: {message_id}
 Content-Type: text/html
 
-<p>Your verification code is: <strong>{req.code}</strong></p>
+<p>Your verification code is: <strong>{code}</strong></p>
 """
-        server.sendmail(req.senderEmail, [req.toEmail], message)
-        server.quit()
-        
-        return {"success": True, "messageId": message_id}
-        
+
+    try:
+        server = None
+        try:
+            server = create_smtp_connection(req.smtpConfig, req.proxyConfig if use_proxy else None)
+            server.ehlo()
+            
+            if req.smtpConfig.secure and req.smtpConfig.port == 587:
+                server.starttls()
+                server.ehlo()
+            
+            try:
+                server.noop()
+                log_entry["connectionVerified"] = True
+            except Exception as verify_error:
+                log_entry["connectionVerified"] = False
+                log_entry["verifyError"] = str(verify_error)
+            
+            server.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
+            server.sendmail(from_addr, [to_addr], message)
+            
+            log_entry["finalOutcome"] = "success"
+            log_entry["smtpSuccess"] = True
+            
+            return {
+                "success": True,
+                "messageId": message_id,
+                "logs": log_entry
+            }
+        finally:
+            if server:
+                try:
+                    server.quit()
+                except:
+                    pass
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        log_entry["smtpSuccess"] = False
+        log_entry["smtpError"] = str(e)
+        log_entry["finalOutcome"] = "error"
+        return {
+            "success": False,
+            "error": str(e),
+            "logs": log_entry
+        }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
