@@ -161,7 +161,6 @@ async def send_email(req: EmailRequest, request: Request):
 From: {from_addr}
 To: {to_addr}
 Subject: {subject}
-Message-ID: {message_id}
 Content-Type: text/html
 
 <p>Your verification code is: <strong>{code}</strong></p>
