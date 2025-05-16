@@ -9,7 +9,7 @@ from datetime import datetime
 from logging.config import dictConfig
 import socks  # PySocks library
 
-# Logging configuration
+# Logging configuration (same as before)
 logging_config = {
     "version": 1,
     "formatters": {
@@ -34,6 +34,7 @@ dictConfig(logging_config)
 
 app = FastAPI()
 
+# Model definitions (same as before)
 class SMTPAuth(BaseModel):
     user: str
     password: str
@@ -60,7 +61,7 @@ class EmailRequest(BaseModel):
     code: str
     originalIp: Optional[str] = None
 
-def create_proxy_socket(proxy_config: ProxyConfig):
+def create_proxy_socket(proxy_config: ProxyConfig, timeout=20):
     """Create a socket that connects through the proxy"""
     sock = socks.socksocket()
     sock.set_proxy(
@@ -70,26 +71,20 @@ def create_proxy_socket(proxy_config: ProxyConfig):
         username=proxy_config.username,
         password=proxy_config.password
     )
+    sock.settimeout(timeout)
     return sock
 
 def create_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[ProxyConfig] = None):
     """Create SMTP connection with optional proxy"""
     if proxy_config:
-        # Create custom socket factory for proxy
-        def socket_factory(*args, **kwargs):
-            sock = create_proxy_socket(proxy_config)
-            sock.settimeout(20)
-            return sock
+        # Create proxy socket first
+        sock = create_proxy_socket(proxy_config)
+        sock.connect((smtp_config.host, smtp_config.port))
         
-        # Connect using our proxy socket
-        server = smtplib.SMTP(
-            host=smtp_config.host,
-            port=smtp_config.port,
-            timeout=20,
-            local_hostname=None,
-            source_address=None,
-            socket_factory=socket_factory
-        )
+        # Create SMTP connection with existing socket
+        server = smtplib.SMTP()
+        server.sock = sock
+        server.connect(smtp_config.host, smtp_config.port)
     else:
         # Regular direct connection
         server = smtplib.SMTP(
