@@ -80,8 +80,8 @@ async def send_email(req: EmailRequest, request: Request):
                 log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
                 use_proxy = True
                 
-                # Reset proxy settings in case of previous failures
-                socks.setdefaultproxy()  # Clear existing proxy
+                # Reset any existing proxy settings
+                socks.setdefaultproxy()
                 socks.setdefaultproxy(
                     socks.SOCKS5,
                     req.proxyConfig.host,
@@ -90,15 +90,13 @@ async def send_email(req: EmailRequest, request: Request):
                     req.proxyConfig.username,
                     req.proxyConfig.password
                 )
-                socket.socket = socks.socksocket  # Apply proxy to all sockets
-            else:
-                raise Exception('Failed to get proxy IP')
+                socket.socket = socks.socksocket
         except Exception as e:
             log_entry["proxyError"] = str(e)
             log_entry["fallbackToDirect"] = True
-            # Reset to direct connection if proxy fails
-            socks.setdefaultproxy()  # Clear proxy settings
-            socket.socket = socket._socketobject  # Restore original socket
+            # Reset to direct connection
+            socks.setdefaultproxy()
+            socket.socket = socket._socketobject
     else:
         log_entry["noProxyConfigured"] = True
 
@@ -118,8 +116,8 @@ Content-Type: text/html
     smtp_logs = []
     server = None
     try:
-        # Create SMTP connection with explicit timeout
-        server = smtplib.SMTP(timeout=20)
+        # Create SMTP connection with longer timeout
+        server = smtplib.SMTP(timeout=30)
         server.connect(req.smtpConfig.host, req.smtpConfig.port)
         
         # Log SMTP communication
@@ -127,10 +125,17 @@ Content-Type: text/html
         debug_msgs = []
         server._debug_smtp = lambda *args: debug_msgs.append(" ".join(str(x) for x in args))
         
-        server.ehlo()
+        # Try EHLO first, then fallback to HELO if needed
+        try:
+            code, message = server.ehlo()
+            if code != 250:
+                server.helo()
+        except smtplib.SMTPHeloError:
+            raise Exception("Server refused HELO/EHLO command")
+        
         if req.smtpConfig.secure and req.smtpConfig.port == 587:
             server.starttls()
-            server.ehlo()
+            server.ehlo()  # Re-EHLO after STARTTLS
         
         # Verify connection
         try:
@@ -164,14 +169,11 @@ Content-Type: text/html
             "finalOutcome": "error",
             "smtpSuccess": False
         })
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "success": False,
-                "error": str(e),
-                "logs": log_entry
-            }
-        )
+        return {
+            "success": False,
+            "error": str(e),
+            "logs": log_entry
+        }
     except Exception as e:
         log_entry.update({
             "smtpLogs": smtp_logs,
@@ -179,21 +181,18 @@ Content-Type: text/html
             "finalOutcome": "error",
             "smtpSuccess": False
         })
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "success": False,
-                "error": str(e),
-                "logs": log_entry
-            }
-        )
+        return {
+            "success": False,
+            "error": str(e),
+            "logs": log_entry
+        }
     finally:
         if server:
             try:
                 server.quit()
             except:
                 pass
-        # Always reset proxy settings after use
+        # Always reset proxy settings
         socks.setdefaultproxy()
         socket.socket = socket._socketobject
 
