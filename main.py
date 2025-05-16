@@ -114,9 +114,9 @@ async def send_email(req: EmailRequest, request: Request):
                 log_entry["fallbackToDirect"] = True
                 print(f"Proxy error: {proxy_ip_info['error']}")
         except Exception as e:
-            log_entry["proxyError"] = str(e)
+            log_entry["proxyError"] = repr(e)
             log_entry["fallbackToDirect"] = True
-            print(f"Proxy setup exception: {e}")
+            print(f"Proxy setup exception: {repr(e)}")
 
     # SMTP connection and authentication
     try:
