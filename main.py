@@ -79,24 +79,17 @@ async def send_email(req: EmailRequest, request: Request):
     }
     smtp_logs = []
     use_proxy = False
-    smtp_kwargs = {
-        "hostname": req.smtpConfig.host,
-        "port": req.smtpConfig.port,
-        "username": req.smtpConfig.auth.user,
-        "password": req.smtpConfig.auth.password,
-        "use_tls": req.smtpConfig.secure,
-        "timeout": 10
-    }
+    smtp_sock = None
+
+    # Proxy setup
     if req.proxyConfig and req.proxyConfig.host:
         try:
             proxy_ip_info = await get_proxy_ip(req.proxyConfig)
             if proxy_ip_info["success"]:
                 log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
                 use_proxy = True
-                smtp_kwargs["source_address"] = None
-                smtp_kwargs["tls_context"] = None
-                smtp_kwargs["sock"] = socks.socksocket()
-                smtp_kwargs["sock"].set_proxy(
+                smtp_sock = socks.socksocket()
+                smtp_sock.set_proxy(
                     socks.SOCKS5,
                     req.proxyConfig.host,
                     req.proxyConfig.port,
@@ -110,27 +103,26 @@ async def send_email(req: EmailRequest, request: Request):
             log_entry["proxyError"] = str(e)
             log_entry["fallbackToDirect"] = True
 
-try:
-    smtp = aiosmtplib.SMTP(
-        hostname=req.smtpConfig.host,
-        port=req.smtpConfig.port,
-        timeout=10
-    )
-    await smtp.connect()
+    # SMTP connection and authentication
+    try:
+        smtp = aiosmtplib.SMTP(
+            hostname=req.smtpConfig.host,
+            port=req.smtpConfig.port,
+            timeout=10,
+            sock=smtp_sock
+        )
+        await smtp.connect()
+        # If secure is True, use STARTTLS (for port 587)
+        if req.smtpConfig.secure:
+            await smtp.starttls()
+        await smtp.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
+        log_entry["connectionVerified"] = True
+    except Exception as e:
+        log_entry["connectionVerified"] = False
+        log_entry["verifyError"] = str(e)
+        return {"success": False, "error": str(e), "logs": log_entry}
 
-    # If secure is True, use STARTTLS (for port 587)
-    if req.smtpConfig.secure:
-        await smtp.starttls()
-
-    await smtp.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
-
-    log_entry["connectionVerified"] = True
-except Exception as e:
-    log_entry["connectionVerified"] = False
-    log_entry["verifyError"] = str(e)
-    return {"success": False, "error": str(e), "logs": log_entry}
-
-
+    # Send email
     try:
         from_addr = f'"{req.senderName}" <{req.senderEmail}>'
         to_addr = req.toEmail
