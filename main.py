@@ -129,13 +129,18 @@ async def send_email(req: EmailRequest, request: Request):
                 log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
                 use_proxy = True
                 log_entry["proxyUsed"] = True
+                log_entry["connectionType"] = "proxy"
             else:
-                raise Exception('Failed to get proxy IP')
+                log_entry["proxyError"] = proxy_ip_info["error"]
+                log_entry["fallbackToDirect"] = True
+                log_entry["connectionType"] = "direct"
         except Exception as e:
             log_entry["proxyError"] = str(e)
             log_entry["fallbackToDirect"] = True
+            log_entry["connectionType"] = "direct"
     else:
         log_entry["noProxyConfigured"] = True
+        log_entry["connectionType"] = "direct"
 
     message_id = f"<{uuid.uuid4()}@{req.smtpConfig.host}>"
     from_addr = f'"{req.senderName}" <{req.senderEmail}>'
@@ -170,7 +175,6 @@ Content-Type: text/html
         server.sendmail(from_addr, [to_addr], message)
         server.quit()
         
-        log_entry["connectionType"] = "proxy" if use_proxy else "direct"
         log_entry["finalOutcome"] = "success"
         log_entry["smtpSuccess"] = True
         
