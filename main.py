@@ -33,7 +33,6 @@ logging_config = {
 }
 
 dictConfig(logging_config)
-logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -69,7 +68,6 @@ def proxy_context(proxy_config: Optional[ProxyConfig] = None):
     original_socket = socket.socket
     try:
         if proxy_config:
-            logger.info(f"Setting up proxy: {proxy_config.host}:{proxy_config.port}")
             socks.setdefaultproxy(
                 socks.SOCKS5,
                 proxy_config.host,
@@ -85,78 +83,19 @@ def proxy_context(proxy_config: Optional[ProxyConfig] = None):
         socks.setdefaultproxy(None)
         socket.socket = original_socket
 
-async def get_external_ip() -> Optional[str]:
-    """Get external IP using multiple fallback services"""
-    services = [
-        ("icanhazip.com", 80),
-        ("api.ipify.org", 80),
-        ("ident.me", 80),
-        ("myexternalip.com", 80)
-    ]
-    
-    for host, port in services:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(5)
-                s.connect((host, port))
-                s.sendall(b"GET / HTTP/1.1\r\nHost: " + host.encode() + b"\r\n\r\n")
-                response = s.recv(4096).decode()
-                if response:
-                    # Extract IP from HTTP response
-                    ip = response.split("\r\n\r\n")[-1].strip()
-                    if ip and "." in ip:  # Basic IP validation
-                        return ip
-        except Exception as e:
-            logger.warning(f"Failed to get IP from {host}: {str(e)}")
-            continue
-    
-    return None
-
 async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_config: ProxyConfig) -> dict:
-    """Test proxy connection and get the proxy IP using multiple methods"""
-    proxy_ip = None
-    methods_used = []
-    
+    """Test proxy connection and get the proxy IP"""
     try:
         with proxy_context(proxy_config):
-            # Method 1: Get IP from SMTP connection
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(10)
-                    s.connect((smtp_host, smtp_port))
-                    proxy_ip = s.getpeername()[0]
-                    methods_used.append("smtp_peername")
-            except Exception as e:
-                logger.warning(f"SMTP peername method failed: {str(e)}")
-            
-            # Method 2: Get external IP from public services
-            if not proxy_ip:
-                external_ip = await get_external_ip()
-                if external_ip:
-                    proxy_ip = external_ip
-                    methods_used.append("external_service")
-            
-            # Method 3: Get local socket address (less reliable)
-            if not proxy_ip:
-                try:
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                        s.connect(("8.8.8.8", 53))  # Google DNS
-                        proxy_ip = s.getsockname()[0]
-                        methods_used.append("local_socket")
-                except:
-                    pass
-            
-            if proxy_ip:
-                return {
-                    "success": True,
-                    "proxyIP": proxy_ip,
-                    "methodsUsed": methods_used
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": "Could not determine proxy IP using any method"
-                }
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            s.connect((smtp_host, smtp_port))
+            proxy_ip = s.getsockname()[0]  # Gets the proxy's outgoing IP
+            s.close()
+            return {
+                "success": True,
+                "proxyIP": proxy_ip
+            }
     except Exception as e:
         return {
             "success": False,
@@ -166,7 +105,7 @@ async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_config: ProxyConfig
 def create_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[ProxyConfig] = None):
     """Create SMTP connection with optional proxy"""
     with proxy_context(proxy_config):
-        server = smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=20)
+        server = smtplib.SMTP(smtp_config.host, smmtp_config.port, timeout=20)
         server.set_debuglevel(1)
         return server
 
@@ -194,26 +133,21 @@ async def send_email(req: EmailRequest, request: Request):
         try:
             proxy_ip_info = await get_proxy_ip(req.smtpConfig.host, req.smtpConfig.port, req.proxyConfig)
             if proxy_ip_info["success"]:
-                log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
-                log_entry["proxyMethodsUsed"] = proxy_ip_info.get("methodsUsed", [])
+                log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]  # Log proxy IP
                 use_proxy = True
                 log_entry["proxyUsed"] = True
                 log_entry["connectionType"] = "proxy"
-                logger.info(f"Proxy connection established. IP: {proxy_ip_info['proxyIP']}")
             else:
                 log_entry["proxyError"] = proxy_ip_info["error"]
                 log_entry["fallbackToDirect"] = True
                 log_entry["connectionType"] = "direct"
-                logger.warning(f"Proxy failed, falling back to direct. Error: {proxy_ip_info['error']}")
         except Exception as e:
             log_entry["proxyError"] = str(e)
             log_entry["fallbackToDirect"] = True
             log_entry["connectionType"] = "direct"
-            logger.error(f"Proxy setup error: {str(e)}")
     else:
         log_entry["noProxyConfigured"] = True
         log_entry["connectionType"] = "direct"
-        logger.info("No proxy configured, using direct connection")
 
     message_id = f"<{uuid.uuid4()}@{req.smtpConfig.host}>"
     from_addr = f'"{req.senderName}" <{req.senderEmail}>'
@@ -243,18 +177,15 @@ Content-Type: text/html
             try:
                 server.noop()
                 log_entry["connectionVerified"] = True
-                logger.info("SMTP connection verified")
             except Exception as verify_error:
                 log_entry["connectionVerified"] = False
                 log_entry["verifyError"] = str(verify_error)
-                logger.warning(f"SMTP connection verification failed: {str(verify_error)}")
             
             server.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
             server.sendmail(from_addr, [to_addr], message)
             
             log_entry["finalOutcome"] = "success"
             log_entry["smtpSuccess"] = True
-            logger.info(f"Email sent successfully to {to_addr}")
             
             return {
                 "success": True,
@@ -265,13 +196,12 @@ Content-Type: text/html
             if server:
                 try:
                     server.quit()
-                except Exception as e:
-                    logger.warning(f"Error while quitting SMTP server: {str(e)}")
+                except:
+                    pass
     except Exception as e:
         log_entry["smtpSuccess"] = False
         log_entry["smtpError"] = str(e)
         log_entry["finalOutcome"] = "error"
-        logger.error(f"Email sending failed: {str(e)}")
         return {
             "success": False,
             "error": str(e),
@@ -280,4 +210,4 @@ Content-Type: text/html
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 3000)), log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
