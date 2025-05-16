@@ -3,6 +3,7 @@ import uuid
 import smtplib
 import socks
 import datetime
+import traceback
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import Optional, List
@@ -80,9 +81,37 @@ def send_email(req: EmailRequest, request: Request):
     }
     smtp_logs: List[str] = []
     use_proxy = False
-    proxy_agent_error = None
 
-    # Set up proxy if provided
+    # Proxy test: Try connecting to the SMTP server via the proxy first
+    if req.proxyConfig and req.proxyConfig.host:
+        try:
+            print("Testing proxy connection to SMTP server...")
+            test_sock = socks.socksocket()
+            test_sock.set_proxy(
+                socks.SOCKS5,
+                req.proxyConfig.host,
+                req.proxyConfig.port,
+                True,
+                req.proxyConfig.username,
+                req.proxyConfig.password
+            )
+            test_sock.settimeout(20)
+            test_sock.connect((req.smtpConfig.host, req.smtpConfig.port))
+            print("Proxy can reach SMTP server!")
+            test_sock.close()
+        except Exception as e:
+            tb = traceback.format_exc()
+            print("Proxy cannot reach SMTP server:", repr(e))
+            print(tb)
+            log_entry["proxyError"] = str(e)
+            log_entry["proxyTraceback"] = tb
+            return {
+                "success": False,
+                "error": f"Proxy cannot reach SMTP server: {e}",
+                "logs": log_entry
+            }
+
+    # Set up proxy for smtplib if provided
     if req.proxyConfig and req.proxyConfig.host:
         try:
             proxy_ip_info = get_proxy_ip(req.proxyConfig)
