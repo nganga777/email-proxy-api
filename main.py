@@ -75,7 +75,7 @@ async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_host: str, proxy_po
         server = smtplib.SMTP(smtp_host, smtp_port, timeout=20)
         server.ehlo()
         
-        proxy_ip = server.getpeername()[0]
+        proxy_ip = server.socket.getpeername()[0]
         server.quit()
         return {
             "success": True,
