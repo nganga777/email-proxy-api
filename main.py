@@ -112,9 +112,8 @@ async def send_email(req: EmailRequest, request: Request):
             sock=smtp_sock
         )
         await smtp.connect()
-        # If secure is True, use STARTTLS (for port 587)
-        if req.smtpConfig.secure:
-            await smtp.starttls()
+        if req.smtpConfig.secure and req.smtpConfig.port == 587:
+        await smtp.starttls()
         await smtp.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
         log_entry["connectionVerified"] = True
     except Exception as e:
