@@ -70,13 +70,13 @@ async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_host: str, proxy_po
             proxy_username,
             proxy_password
         )
-        socks.wrapmodule(smtplib)
+        socks.wrapmodule(socket)
         
-        server = smtplib.SMTP(smtp_host, smtp_port, timeout=20)
-        server.ehlo()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((smtp_host, smtp_port))
         
-        proxy_ip = server.socket.getpeername()[0]
-        server.quit()
+        proxy_ip = s.getpeername()[0]
+        s.close()
         return {
             "success": True,
             "proxyIP": proxy_ip
