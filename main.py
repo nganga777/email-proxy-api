@@ -105,7 +105,7 @@ async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_config: ProxyConfig
 def create_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[ProxyConfig] = None):
     """Create SMTP connection with optional proxy"""
     with proxy_context(proxy_config):
-        server = smtplib.SMTP(smtp_config.host, smmtp_config.port, timeout=20)
+        server = smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=20)  # Fixed typo here
         server.set_debuglevel(1)
         return server
 
