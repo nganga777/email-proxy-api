@@ -3,13 +3,12 @@ import uuid
 import smtplib
 import socks
 import socket
-import requests  # Added for public IP check
+import logging
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 from logging.config import dictConfig
-import logging
 from contextlib import contextmanager
 
 # Logging configuration
@@ -85,28 +84,18 @@ def proxy_context(proxy_config: Optional[ProxyConfig] = None):
         socket.socket = original_socket
 
 async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_config: ProxyConfig) -> dict:
-    """Test proxy connection and get the proxy's PUBLIC IP"""
+    """Test proxy connection and get the proxy IP"""
     try:
         with proxy_context(proxy_config):
-            # Option 1: Get public IP via external service (recommended)
-            try:
-                public_ip = requests.get("https://api.ipify.org", timeout=5).text
-                return {
-                    "success": True,
-                    "proxyIP": public_ip  # Matches SMTP server logs (e.g., 108.196.138.166)
-                }
-            except requests.RequestException:
-                # Fallback: Get internal IP (less accurate)
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(5)
-                s.connect((smtp_host, smtp_port))
-                internal_ip = s.getsockname()[0]  # Internal IP (e.g., 10.250.11.171)
-                s.close()
-                return {
-                    "success": True,
-                    "proxyIP": internal_ip,
-                    "warning": "Fell back to internal IP (public IP fetch failed)"
-                }
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            s.connect((smtp_host, smtp_port))
+            proxy_ip = s.getsockname()[0]  # Gets the proxy's outgoing IP
+            s.close()
+            return {
+                "success": True,
+                "proxyIP": proxy_ip
+            }
     except Exception as e:
         return {
             "success": False,
@@ -116,9 +105,16 @@ async def get_proxy_ip(smtp_host: str, smtp_port: int, proxy_config: ProxyConfig
 def create_smtp_connection(smtp_config: SMTPConfig, proxy_config: Optional[ProxyConfig] = None):
     """Create SMTP connection with optional proxy"""
     with proxy_context(proxy_config):
-        server = smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=20)
-        server.set_debuglevel(1)
-        return server
+        try:
+            if smtp_config.port == 465:
+                server = smtplib.SMTP_SSL(smtp_config.host, smtp_config.port, timeout=20)
+            else:
+                server = smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=20)
+            server.set_debuglevel(2)  # Enable verbose logging
+            return server
+        except Exception as e:
+            logging.error(f"SMTP Connection Error: {str(e)}")
+            raise
 
 @app.post("/send-email")
 async def send_email(req: EmailRequest, request: Request):
@@ -144,12 +140,10 @@ async def send_email(req: EmailRequest, request: Request):
         try:
             proxy_ip_info = await get_proxy_ip(req.smtpConfig.host, req.smtpConfig.port, req.proxyConfig)
             if proxy_ip_info["success"]:
-                log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]  # Now logs public IP
+                log_entry["afterProxyIp"] = proxy_ip_info["proxyIP"]
                 use_proxy = True
                 log_entry["proxyUsed"] = True
                 log_entry["connectionType"] = "proxy"
-                if "warning" in proxy_ip_info:
-                    log_entry["warning"] = proxy_ip_info["warning"]
             else:
                 log_entry["proxyError"] = proxy_ip_info["error"]
                 log_entry["fallbackToDirect"] = True
@@ -181,30 +175,50 @@ Content-Type: text/html
         server = None
         try:
             server = create_smtp_connection(req.smtpConfig, req.proxyConfig if use_proxy else None)
-            server.ehlo()
             
+            # Extended handshake process
+            server.ehlo()
             if req.smtpConfig.secure and req.smtpConfig.port == 587:
                 server.starttls()
                 server.ehlo()
             
+            # Verify connection
             try:
                 server.noop()
                 log_entry["connectionVerified"] = True
             except Exception as verify_error:
                 log_entry["connectionVerified"] = False
                 log_entry["verifyError"] = str(verify_error)
+                raise Exception(f"Connection verification failed: {verify_error}")
             
+            # Authenticate
             server.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
-            server.sendmail(from_addr, [to_addr], message)
             
-            log_entry["finalOutcome"] = "success"
-            log_entry["smtpSuccess"] = True
-            
-            return {
-                "success": True,
-                "messageId": message_id,
-                "logs": log_entry
-            }
+            # Send email
+            send_result = server.sendmail(from_addr, [to_addr], message)
+            if not send_result:  # Empty dict means success
+                log_entry["finalOutcome"] = "success"
+                log_entry["smtpSuccess"] = True
+                return {
+                    "success": True,
+                    "messageId": message_id,
+                    "logs": log_entry
+                }
+            else:
+                raise Exception(f"Send failed: {send_result}")
+                
+        except smtplib.SMTPAuthenticationError as e:
+            log_entry["smtpError"] = f"Authentication failed: {str(e)}"
+            raise
+        except smtplib.SMTPException as e:
+            log_entry["smtpError"] = f"SMTP protocol error: {str(e)}"
+            raise
+        except socket.timeout:
+            log_entry["smtpError"] = "Connection timed out"
+            raise
+        except Exception as e:
+            log_entry["smtpError"] = f"Unexpected error: {str(e)}"
+            raise
         finally:
             if server:
                 try:
@@ -212,8 +226,6 @@ Content-Type: text/html
                 except:
                     pass
     except Exception as e:
-        log_entry["smtpSuccess"] = False
-        log_entry["smtpError"] = str(e)
         log_entry["finalOutcome"] = "error"
         return {
             "success": False,
