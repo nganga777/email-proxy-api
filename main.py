@@ -1,5 +1,6 @@
 import os
 import socket
+import uuid
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -105,6 +106,9 @@ async def send_email(req: EmailRequest, request: Request):
                     username=req.proxyConfig.username,
                     password=req.proxyConfig.password
                 )
+                smtp_sock.settimeout(20)
+                smtp_sock.connect((req.smtpConfig.host, req.smtpConfig.port))
+                smtp_sock.setblocking(False)
             else:
                 log_entry["proxyError"] = proxy_ip_info["error"]
                 log_entry["fallbackToDirect"] = True
@@ -155,10 +159,13 @@ async def send_email(req: EmailRequest, request: Request):
         to_addr = req.toEmail
         subject = req.subject
         code = req.code
+        # Generate a Message-ID
+        message_id = f"<{uuid.uuid4()}@{req.smtpConfig.host}>"
         message = f"""\
 From: {from_addr}
 To: {to_addr}
 Subject: {subject}
+Message-ID: {message_id}
 Content-Type: text/html
 
 <p>Your verification code is: <strong>{code}</strong></p>
@@ -171,15 +178,6 @@ Content-Type: text/html
         log_entry["smtpLogs"] = smtp_logs
         log_entry["connectionType"] = "proxy" if use_proxy else "direct"
         log_entry["finalOutcome"] = "success"
-
-        # Fix: handle both dict and tuple result
-        message_id = ""
-        if isinstance(result, dict):
-            message_id = result.get("message-id", "")
-        elif isinstance(result, tuple) and len(result) > 0:
-            message_id = str(result[0])
-        else:
-            message_id = str(result)
 
         return {
             "success": True,
