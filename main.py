@@ -111,10 +111,20 @@ async def send_email(req: EmailRequest, request: Request):
             log_entry["fallbackToDirect"] = True
 
     try:
-        smtp = aiosmtplib.SMTP(**smtp_kwargs)
-        await smtp.connect()
-        await smtp.starttls() if req.smtpConfig.secure else None
-        await smtp.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
+        
+    smtp = aiosmtplib.SMTP(
+    hostname=req.smtpConfig.host,
+    port=req.smtpConfig.port,
+    timeout=10
+    )
+await smtp.connect()
+
+# If secure is True, use STARTTLS (for port 587)
+if req.smtpConfig.secure:
+    await smtp.starttls()
+
+await smtp.login(req.smtpConfig.auth.user, req.smtpConfig.auth.password)
+
         log_entry["connectionVerified"] = True
     except Exception as e:
         log_entry["connectionVerified"] = False
