@@ -97,6 +97,7 @@ def send_email(req: EmailRequest, request: Request):
             use_proxy = True
         except Exception as e:
             log_entry["proxyError"] = repr(e)
+            log_entry["afterProxyIp"] = None
             return {"success": False, "error": f"Proxy setup failed: {e}", "logs": log_entry}
     else:
         log_entry["proxyUsed"] = False
@@ -140,18 +141,14 @@ Content-Type: text/html
         log_entry["smtpSuccess"] = False
         log_entry["smtpError"] = repr(e)
         log_entry["smtpLogs"] = smtp_logs
-        # Always include afterProxyIp, even if None
         log_entry["afterProxyIp"] = None
         return {"success": False, "error": str(e), "logs": log_entry}
 
     # Now, after sending the email, check the proxy IP if proxy was used
     if use_proxy:
         after_proxy_ip = get_proxy_ip(req.proxyConfig)
-        if after_proxy_ip:
-            log_entry["afterProxyIp"] = after_proxy_ip
-
-    # Always include afterProxyIp, even if None
-    if "afterProxyIp" not in log_entry:
+        log_entry["afterProxyIp"] = after_proxy_ip if after_proxy_ip else None
+    else:
         log_entry["afterProxyIp"] = None
 
     return {
