@@ -140,6 +140,8 @@ Content-Type: text/html
         log_entry["smtpSuccess"] = False
         log_entry["smtpError"] = repr(e)
         log_entry["smtpLogs"] = smtp_logs
+        # Always include afterProxyIp, even if None
+        log_entry["afterProxyIp"] = None
         return {"success": False, "error": str(e), "logs": log_entry}
 
     # Now, after sending the email, check the proxy IP if proxy was used
@@ -147,6 +149,10 @@ Content-Type: text/html
         after_proxy_ip = get_proxy_ip(req.proxyConfig)
         if after_proxy_ip:
             log_entry["afterProxyIp"] = after_proxy_ip
+
+    # Always include afterProxyIp, even if None
+    if "afterProxyIp" not in log_entry:
+        log_entry["afterProxyIp"] = None
 
     return {
         "success": True,
