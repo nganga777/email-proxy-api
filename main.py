@@ -162,13 +162,24 @@ Content-Type: text/html
         print("Sending email...")
         result = await smtp.sendmail(from_addr, [to_addr], message)
         await smtp.quit()
+        print(f"Sendmail result: {result}")
         print("Email sent and SMTP connection closed.")
         log_entry["smtpLogs"] = smtp_logs
         log_entry["connectionType"] = "proxy" if use_proxy else "direct"
         log_entry["finalOutcome"] = "success"
+
+        # Fix: handle both dict and tuple result
+        message_id = ""
+        if isinstance(result, dict):
+            message_id = result.get("message-id", "")
+        elif isinstance(result, tuple) and len(result) > 0:
+            message_id = str(result[0])
+        else:
+            message_id = str(result)
+
         return {
             "success": True,
-            "messageId": result.get("message-id", ""),
+            "messageId": message_id,
             "logs": log_entry
         }
     except Exception as e:
